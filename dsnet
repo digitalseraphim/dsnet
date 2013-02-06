@@ -1,0 +1,279 @@
+
+// message:
+//   source
+//   dest
+//   message_id
+//   message
+
+
+local sOpenedSide = nil
+local bDebug = true
+local iMyId = os.getComputerId()
+
+local function debug(msg)
+	if bDebug then
+		print(msg)
+	end
+end
+
+function open(sSide)
+	local bOpen, sFreeSide = false, nil
+	
+	if sSide != nil then
+		if peripheral.getType( sSide ) == "modem" then		
+			debug( "Opening "..sSide.." modem" )
+			rednet.open( sSide )
+			if rednet.isOpen( sSide ) then
+				debug("Rednet open on "..sSide)
+				bOpen = true
+			else
+				debug("Rednet did not open on "..sSide)
+				bOpen = false
+			end
+		end
+		return bOpen
+	else
+		for n,sSide in pairs(rs.getSides()) do	
+			if peripheral.getType( sSide ) == "modem" then
+				sFreeSide = sSide
+				if rednet.isOpen( sSide ) then
+					bOpen = true
+					break
+				end
+			end
+		end
+	end
+	
+	if not bOpen then
+		if sFreeSide then
+			print( "No modem active. Opening "..sFreeSide.." modem" )
+			rednet.open( sFreeSide )
+			sOpenedSide = sFreeSide
+			return true
+		else
+			print( "No modem attached" )
+			return false
+		end
+	end
+	return true
+end
+
+local iLastMsgId = 0
+local iTimeout = 2
+local iLastGateway = -1
+local fLastGatewayClock = -1
+local fGatewayUpdateTimeout = 5 * 60 -- 5 real minutes
+
+local function createMsg(type, data)
+	return { msgType: type, data: data}
+end
+
+local function msgToString(msg)
+	local sMsg = nil
+	
+	if type(msg) == "table" then
+		sMsg = textutils.serialize(msg)
+	else
+		sMsg = tostring(msg)
+	end
+	
+	return sMsg
+end
+
+local function broadcast(msg)
+	rednet.broadcast("DSNET " .. msgToString(msg))
+end
+
+local function route(gw, msg)
+	rednet.send(gw, "DSNET " .. msgToString(createMsg("ROUTE",msg)))
+end
+
+local function parseMessage(msg)
+	if string.find(msg, "DSNET") != 1 then
+		return false
+	end
+	
+	return true, textutils.unserialize(string.sub(msg, 7))
+end
+
+
+local function getGateway()
+	local fClock = os.clock()
+	
+	if fClock > fLastGatewayClock + fGatewayUpdateTimeout then
+		broadcast(createMsg("GATEWAY_DISCOVERY"))
+		
+		local iBestGateway = -1
+		local fBestGatewayDistance = -1
+		local fStartClock = os.clock()
+		
+		while os.clock < fStartClock + iTimeout do
+			local sender,message,distance = rednet.receive()
+			local isMsg, msg = parseMessage(message)
+			
+			if isMsg && msg["msgType"] == "GATEWAY_OFFER" then
+				if fBestGatewayDistance == -1 || fBestGatewayDistance > distance then
+					fBestGatewayDistance = distance
+					iBestGateway = sender
+				end
+			end
+		end
+		
+		if iBestGateway == -1 then
+			debug("couldnt find a gateway")
+			iLastGateway = -1
+		else
+			debug("using gateway " .. iBestGateway)
+			iLastGateway = iBestGateway
+		end
+	end
+	
+	return iLastGateway
+end
+
+// message:
+//   msgId
+//   src
+//   dest
+//   msg
+
+function send(dest, msg)
+	local tMsg = {}
+	
+	iLastMsgId = iLastMsgId + 1
+	tMsg["msgId"] = iLastMsgId
+	tMsg["src"] = iMyId
+	tMsg["dest"] = dest
+	tMsg["msg"] = msg
+
+	local gw = getGateway()
+
+	if gw > 0 then
+		route(tMsg)
+	else
+		debug("couldn't find gateway")
+	end	
+end
+
+local msgBuffer = {}
+
+function clientLoop()
+	while true do
+		sender, msg, distance = rednet.receive()
+		isMsg, m = parseMessage(msg)
+		
+		if isMsg then
+			if m["msgType"] == "PING" then
+				rednet.send(sender, "DSNET " .. msgToString(createMsg("PONG")))
+			else
+				table.insert(m)
+			end
+		end
+	end
+end
+
+function receive(wait)
+	repeat
+		m = table.remove(msgBuffer,1)
+	until !wait || m
+end
+
+local tLocalClients = {}
+local fPingTimeout = 2 -- seconds
+local fClientStale = 5*60 -- 5 real minutes
+local fFindHopTimeout = 8 -- seconds
+
+local function pingClient(id)
+	rednet.send(id, "DSNET " .. msgToString(createMsg("PING")))
+	local startTime = os.clock()
+	while os.clock() < startTime + fPingTimeout do
+		sender, msg, distance = rednet.receive()
+
+		isMsg, m = parseMessage(msg)
+		if isMsg then
+			if m["msgType"] == "PONG" then
+				tLocalClients[id] = os.clock()
+				return true
+			end
+			handleMsg(sender, m, distance)
+		end
+	end
+	return false
+end
+
+
+local function findHop(dest)
+	rednet.broadcast("DSNET " .. msgToSTring(createMsg("FINDHOP", dest)))
+
+	local startTime = os.clock()
+	local bestHop = -1
+	local bestHopDist = -1
+	
+	while os.clock() < startTime + fFindHopTimeout do
+		sender, msg, distance = rednet.receive()
+
+		isMsg, m = parseMessage(msg)
+		if isMsg then
+			if m["msgType"] == "HOP" then
+				if bestHopDist == -1 || m["data"] < bestHopDist then
+					bestHopDist = innerMsg["data"]
+					bestHop = m["src"]
+				end
+			else
+				handleMsg(sender, m, distance)
+			end
+		end
+	end
+	if bestHop > 0 then
+		tRemoteClients[dest] = { ping: os.clock(), hop: bestHop}
+	else
+		tRemoteClients[dest] = nil
+	end
+end
+
+
+local function handleMsg(sender, msg, distance)
+	if isMsg then
+		local msgType = m["msgType"]
+		
+		if msgType == "ROUTE" then
+			dest = m["dest"]
+			lastPing = tLocalClients[dest]
+			
+			if !lastPing then
+				if tRemoteClients[dest] then
+					lastPing = tRemoteClients[dest]["ping"]
+				end
+			end
+			
+			if !lastPing || lastPing + fClientStale < os.clock() then
+				if pingClient(dest) then
+					rednet.send(dest, "DSNET " .. msgToString(msg))
+				else
+					hop = findHop(dest)
+					if hop then
+						rednet.send(hop, "DSNET " .. msgToString(msg))
+					else
+						debug("couldn't find next hop")
+					end
+				end
+			else
+				rednet.send(dest, "DSNET " .. msgToString(msg))
+			end
+		elseif msgType == "FINDHOP" then
+			
+		end
+	end
+end
+
+function routerLoop()
+	while true do
+		sender, msg, distance = rednet.receive()
+		isMsg, m = parseMessage(msg)
+		if isMsg then
+			handleMsg(sender, m, distance)
+		end
+	end
+end
+
+-- vim: ft=lua
